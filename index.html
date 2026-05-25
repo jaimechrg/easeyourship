@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ease Your Ship</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #08080f; }
+    input::placeholder { color: #3a3a52; }
+    @keyframes eysbounce {
+      0%, 100% { transform: translateY(0); opacity: 0.4; }
+      50% { transform: translateY(-4px); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+const PROXY = "/api/claude";
+
+const SYSTEM_PROMPT = `You are a friendly shipping assistant for a service called Ease Your Ship (easeyourship.com). Your job is to help users get shipping rate quotes in the simplest, most pleasant way possible.
+
+CONVERSATION FLOW:
+1. Greet the user warmly and ask what they're shipping. Also mention they can enter dimensions/weight manually if they prefer not to share what it is.
+2. If they describe their item, estimate:
+   - Typical weight of the item
+   - Recommended box size (length x width x height in inches)
+   - Briefly explain your estimates so the user feels confident
+3. Ask for origin ZIP code.
+4. Ask for destination ZIP code.
+5. Once you have ALL info (weight, box size, from ZIP, to ZIP), output ONLY this JSON tag on its own line at the very end:
+
+SHIPPING_QUERY:{"weight_oz": <number>, "length": <number>, "width": <number>, "height": <number>, "from_zip": "<string>", "to_zip": "<string>", "item_description": "<string>"}
+
+RULES:
+- Be warm and conversational, not robotic
+- Explain weight/size estimates briefly and confidently
+- If user is hesitant to share item, offer manual entry option
+- Weight in ounces (1 lb = 16 oz)
+- Box dimensions in inches
+- ONLY output SHIPPING_QUERY when you have ALL values including both ZIP codes
+- After the SHIPPING_QUERY line, write nothing else`;
+
+const RATE_PROMPT = `Based on these shipping rates, give a warm 2-sentence recommendation. Mention the best value and fastest option. Reference what's being shipped.
+Item: {item}
+Rates: {rates}
+Reply in 2 sentences only.`;
+
+function parseShippingQuery(text) {
+  const match = text.match(/SHIPPING_QUERY:(\{[^\n]+\})/);
+  if (match) { try { return JSON.parse(match[1]); } catch { return null; } }
+  return null;
+}
+
+function getMockRates(query) {
+  const baseWeight = query.weight_oz / 16;
+  const diff = Math.abs(parseInt(query.to_zip || "10001") - parseInt(query.from_zip || "90001"));
+  const dist = 1 + Math.min((diff / 99999) * 1.5, 1.5);
+  return [
+    { carrier: "USPS",  service: "Priority Mail",    days: "2–3", price: (6.5  + baseWeight * 0.8 + dist).toFixed(2), logo: "📮" },
+    { carrier: "USPS",  service: "Ground Advantage", days: "3–5", price: (4.8  + baseWeight * 0.6 + dist * 0.7).toFixed(2), logo: "📮" },
+    { carrier: "UPS",   service: "Ground",           days: "3–5", price: (7.2  + baseWeight * 1.1 + dist * 1.1).toFixed(2), logo: "🟫" },
+    { carrier: "UPS",   service: "2nd Day Air",      days: "2",   price: (18   + baseWeight * 1.5 + dist * 2).toFixed(2), logo: "🟫" },
+    { carrier: "FedEx", service: "Ground",           days: "3–5", price: (7.5  + baseWeight * 1.0 + dist).toFixed(2), logo: "🟪" },
+    { carrier: "FedEx", service: "Express Saver",    days: "3",   price: (15   + baseWeight * 1.3 + dist * 1.8).toFixed(2), logo: "🟪" },
+  ].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+}
+
+async function callClaude(messages, system, maxTokens) {
+  const body = { model: "claude-sonnet-4-20250514", max_tokens: maxTokens || 1000, messages };
+  if (system) body.system = system;
+  const res = await fetch(PROXY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  const text = data.content?.[0]?.text;
+  if (!text) throw new Error("Empty response");
+  return text;
+}
+
+function Dots() {
+  return (
+    <div style={{ display:"flex", gap:6, alignItems:"center", padding:"14px 18px",
+      background:"#111120", border:"1px solid #1c1c30", borderRadius:"18px 18px 18px 4px" }}>
+      {[0, 0.2, 0.4].map((d, i) => (
+        <span key={i} style={{ display:"inline-block", width:7, height:7, borderRadius:"50%",
+          background:"#7c6fff", animation:`eysbounce 1.2s ease-in-out ${d}s infinite` }} />
+      ))}
+    </div>
+  );
+}
+
+function App() {
+  const [phase, setPhase]       = useState("landing");
+  const [messages, setMessages] = useState([]);
+  const [history, setHistory]   = useState([]);
+  const [input, setInput]       = useState("");
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState("");
+  const [rates, setRates]       = useState(null);
+  const [rec, setRec]           = useState("");
+  const [query, setQuery]       = useState(null);
+  const bottomRef = useRef(null);
+  const inputRef  = useRef(null);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [messages, rates, loading]);
+  useEffect(() => { if (phase === "chat" && !loading) inputRef.current?.focus(); }, [phase, loading]);
+
+  async function startChat() {
+    setError(""); setLoading(true);
+    try {
+      const seed = { role:"user", content:"Hi, I need to ship something." };
+      const reply = await callClaude([seed], SYSTEM_PROMPT, 1000);
+      setHistory([seed, { role:"assistant", content:reply }]);
+      setMessages([{ role:"assistant", text:reply }]);
+      setPhase("chat");
+    } catch(e) { setError("Couldn't connect — " + e.message); }
+    setLoading(false);
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || loading) return;
+    setInput(""); setError("");
+    setMessages(m => [...m, { role:"user", text }]);
+    setLoading(true);
+    const newHistory = [...history, { role:"user", content:text }];
+    try {
+      const reply = await callClaude(newHistory, SYSTEM_PROMPT, 1000);
+      setHistory([...newHistory, { role:"assistant", content:reply }]);
+      const q = parseShippingQuery(reply);
+      const cleanReply = reply.replace(/SHIPPING_QUERY:.*$/m, "").trim();
+      if (cleanReply) setMessages(m => [...m, { role:"assistant", text:cleanReply }]);
+      if (q) {
+        setQuery(q);
+        const mockRates = getMockRates(q);
+        setRates(mockRates);
+        setPhase("rates");
+        setLoading(false);
+        const rateStr = mockRates.map(r => `${r.carrier} ${r.service}: $${r.price} (${r.days} days)`).join("; ");
+        const prompt = RATE_PROMPT.replace("{item}", q.item_description).replace("{rates}", rateStr);
+        const recommendation = await callClaude([{ role:"user", content:prompt }], null, 200);
+        setRec(recommendation);
+        return;
+      }
+    } catch(e) { setError("Something went wrong — " + e.message); }
+    setLoading(false);
+  }
+
+  function reset() {
+    setPhase("landing"); setMessages([]); setHistory([]);
+    setInput(""); setLoading(false); setError("");
+    setRates(null); setRec(""); setQuery(null);
+  }
+  return (
+    <div style={{ minHeight:"100vh", background:"#08080f",
+      fontFamily:"'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif",
+      display:"flex", flexDirection:"column", alignItems:"center", padding:"0 20px 60px" }}>
+
+      <div style={{ width:"100%", maxWidth:660, padding:"28px 0 20px",
+        borderBottom:"1px solid #181828", marginBottom:28,
+        display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+        <div>
+          <div style={{ display:"flex", alignItems:"baseline" }}>
+            <span style={{ fontSize:26, fontWeight:700, color:"#f0ede8" }}>Ease </span>
+            <span style={{ fontSize:26, fontWeight:400, color:"#7c6fff", fontStyle:"italic" }}>Your </span>
+            <span style={{ fontSize:26, fontWeight:700, color:"#f0ede8" }}>Ship</span>
+          </div>
+          <div style={{ fontSize:11, color:"#44445a", letterSpacing:"0.18em", textTransform:"uppercase", marginTop:3 }}>
+            Smart shipping · Door pickup included
+          </div>
+        </div>
+        {phase !== "landing" && (
+          <button onClick={reset} style={{ background:"none", border:"1px solid #222236",
+            color:"#555", padding:"6px 14px", borderRadius:8, cursor:"pointer",
+            fontSize:12, fontFamily:"inherit" }}>Start over</button>
+        )}
+      </div>
+
+      <div style={{ width:"100%", maxWidth:660 }}>
+        {phase === "landing" && (
+          <div style={{ textAlign:"center", paddingTop:56 }}>
+            <div style={{ width:80, height:80, borderRadius:"50%",
+              background:"linear-gradient(135deg,#7c6fff,#4ecdc4)",
+              margin:"0 auto 32px", display:"flex", alignItems:"center",
+              justifyContent:"center", fontSize:36,
+              boxShadow:"0 0 48px rgba(124,111,255,0.25)" }}>📦</div>
+            <h1 style={{ color:"#f0ede8", fontSize:32, fontWeight:700, margin:"0 0 14px", letterSpacing:"-1px" }}>
+              Shipping without the headache.
+            </h1>
+            <p style={{ color:"#55556a", fontSize:16, lineHeight:1.7, maxWidth:400, margin:"0 auto 44px" }}>
+              Just tell us what you're sending. We'll handle weight, box size,
+              and carrier rates — then send someone to pick it up.
+            </p>
+            {error && (
+              <div style={{ color:"#ff6b6b", fontSize:13, background:"rgba(255,107,107,0.08)",
+                border:"1px solid rgba(255,107,107,0.2)", borderRadius:10,
+                padding:"10px 16px", maxWidth:400, margin:"0 auto 20px" }}>⚠ {error}</div>
+            )}
+            <button onClick={startChat} disabled={loading} style={{
+              background: loading ? "#2a2a3e" : "linear-gradient(135deg,#7c6fff,#5a4fff)",
+              color:"#fff", border:"none", borderRadius:14, padding:"16px 44px",
+              fontSize:16, cursor: loading ? "default" : "pointer", fontFamily:"inherit",
+              boxShadow: loading ? "none" : "0 4px 28px rgba(124,111,255,0.35)" }}>
+              {loading ? "Connecting…" : "Get a shipping quote →"}
+            </button>
+            <div style={{ marginTop:44, display:"flex", gap:36, justifyContent:"center" }}>
+              {["USPS","UPS","FedEx"].map(c => (
+                <span key={c} style={{ color:"#2a2a3e", fontSize:12, letterSpacing:"0.12em" }}>{c}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {(phase === "chat" || phase === "rates") && (
+          <div>
+            <div style={{ display:"flex", flexDirection:"column", gap:14, marginBottom:20 }}>
+              {messages.map((m, i) => (
+                <div key={i} style={{ display:"flex", justifyContent: m.role==="user" ? "flex-end" : "flex-start" }}>
+                  <div style={{ maxWidth:"80%", padding:"13px 17px",
+                    borderRadius: m.role==="user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
+                    background: m.role==="user" ? "linear-gradient(135deg,#7c6fff,#5a4fff)" : "#111120",
+                    color: m.role==="user" ? "#fff" : "#b8b4ac", fontSize:15, lineHeight:1.65,
+                    border: m.role==="assistant" ? "1px solid #1c1c30" : "none",
+                    whiteSpace:"pre-wrap" }}>{m.text}</div>
+                </div>
+              ))}
+              {loading && <div style={{ display:"flex", justifyContent:"flex-start" }}><Dots /></div>}
+              {phase === "rates" && rates && (
+                <div style={{ background:"#111120", border:"1px solid #1c1c30", borderRadius:18, padding:24, marginTop:6 }}>
+                  <div style={{ color:"#44445a", fontSize:10, letterSpacing:"0.2em", textTransform:"uppercase", marginBottom:18 }}>
+                    Carrier Rates · {query && query.item_description}
+                  </div>
+                  {rec && (
+                    <div style={{ background:"rgba(124,111,255,0.07)", border:"1px solid rgba(124,111,255,0.18)",
+                      borderRadius:10, padding:"12px 16px", marginBottom:20, color:"#9d8fff", fontSize:14, lineHeight:1.65 }}>
+                      ✦ {rec}
+                    </div>
+                  )}
+                  <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
+                    {rates.map((r, i) => (
+                      <div key={i} style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+                        padding:"12px 16px", borderRadius:11,
+                        background: i===0 ? "rgba(124,111,255,0.07)" : "#0c0c1a",
+                        border: i===0 ? "1px solid rgba(124,111,255,0.22)" : "1px solid #181828" }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                          <span style={{ fontSize:20 }}>{r.logo}</span>
+                          <div>
+                            <div style={{ color:"#ccc9c0", fontSize:14, fontWeight:600 }}>{r.carrier}</div>
+                            <div style={{ color:"#44445a", fontSize:12 }}>{r.service} · {r.days} days</div>
+                          </div>
+                        </div>
+                        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                          <span style={{ color:"#f0ede8", fontSize:17, fontWeight:700 }}>${r.price}</span>
+                          {i===0 && <span style={{ background:"#7c6fff", color:"#fff", fontSize:9,
+                            padding:"2px 7px", borderRadius:20 }}>BEST</span>}
+                          <button style={{ background:"linear-gradient(135deg,#7c6fff,#5a4fff)",
+                            color:"#fff", border:"none", borderRadius:8, padding:"6px 13px",
+                            cursor:"pointer", fontSize:12, fontFamily:"inherit" }}>Select</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop:18, padding:"14px 16px", background:"rgba(78,205,196,0.05)",
+                    border:"1px solid rgba(78,205,196,0.15)", borderRadius:12,
+                    display:"flex", alignItems:"center", gap:14 }}>
+                    <span style={{ fontSize:22 }}>🛵</span>
+                    <div style={{ flex:1 }}>
+                      <div style={{ color:"#4ecdc4", fontSize:13, fontWeight:600, marginBottom:2 }}>Add door pickup — $5.99</div>
+                      <div style={{ color:"#2a6e6b", fontSize:12 }}>We send a courier to collect your package. Available 8am–8pm.</div>
+                    </div>
+                    <button style={{ background:"rgba(78,205,196,0.12)", border:"1px solid rgba(78,205,196,0.28)",
+                      color:"#4ecdc4", borderRadius:9, padding:"7px 14px", cursor:"pointer",
+                      fontSize:12, fontFamily:"inherit", whiteSpace:"nowrap" }}>Add pickup</button>
+                  </div>
+                </div>
+              )}
+              <div ref={bottomRef}></div>
+            </div>
+            {error && (
+              <div style={{ color:"#ff6b6b", fontSize:13, marginBottom:12,
+                background:"rgba(255,107,107,0.08)", border:"1px solid rgba(255,107,107,0.2)",
+                borderRadius:10, padding:"10px 16px" }}>⚠ {error}</div>
+            )}
+            {phase === "chat" && (
+              <div style={{ display:"flex", gap:10, background:"#111120", border:"1px solid #1c1c30",
+                borderRadius:14, padding:"8px 8px 8px 18px", position:"sticky", bottom:20 }}>
+                <input ref={inputRef} value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => e.key==="Enter" && !e.shiftKey && send()}
+                  placeholder="Type your reply…" disabled={loading}
+                  style={{ flex:1, background:"none", border:"none", outline:"none",
+                    color:"#ccc9c0", fontSize:15, fontFamily:"inherit" }} />
+                <button onClick={send} disabled={loading || !input.trim()} style={{
+                  background: input.trim() && !loading ? "linear-gradient(135deg,#7c6fff,#5a4fff)" : "#181828",
+                  color: input.trim() && !loading ? "#fff" : "#333",
+                  border:"none", borderRadius:10, padding:"10px 20px",
+                  cursor: input.trim() && !loading ? "pointer" : "default",
+                  fontSize:14, fontFamily:"inherit" }}>Send</button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
+
