@@ -81,7 +81,7 @@ async function callClaude(messages, system, maxTokens) {
     body: JSON.stringify(body),
   });
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  if (data.error) throw new Error(JSON.stringify(data.error));
   const text = data.content?.[0]?.text;
   if (!text) throw new Error("Empty response");
   return text;
