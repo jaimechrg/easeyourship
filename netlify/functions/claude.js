@@ -24,10 +24,10 @@ export default async (req) => {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
   } catch (err) {
-    return Response.json({ error: { message: err.message } }, {
-      status: 500,
-      headers: { "Access-Control-Allow-Origin": "*" },
-    });
+    return Response.json(
+      { error: { type: "proxy_error", message: err.message } },
+      { status: 500, headers: { "Access-Control-Allow-Origin": "*" } }
+    );
   }
 };
 
